@@ -1,11 +1,13 @@
 """The streaming core: provider fallback, two deadlines, budget reserve/settle.
 
 Keep `Event` and `explain_stream` exactly as named; the public and hidden tests import them."""
+import asyncio
 from collections.abc import AsyncIterator, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass, field
 
-from app.budget import DailyBudget
-from app.providers import LLMProvider
+from app.budget import DailyBudget, actual_cost_usd, estimate_cost_usd
+from app.providers import LLMProvider, ProviderError
 
 
 @dataclass(frozen=True)
@@ -17,26 +19,92 @@ class Event:
 async def explain_stream(prompt: str, providers: Sequence[LLMProvider], *, tenant: str,
                          budget: DailyBudget, ttft_timeout_s: float, total_timeout_s: float,
                          max_output_tokens: int) -> AsyncIterator[Event]:
-    """Yield Event("meta", ...), Event("token", ...)* and a final Event("done" | "error", ...).
+    """Yield Event("meta", ...), Event("token", ...)* and a final Event("done" | "error", ...)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + total_timeout_s
+    attempted = False
 
-    Rules, in order (see README.md for the full statement):
-    - Try providers in the given order. Before each, reserve its estimate; skip an
-      unaffordable provider without calling it.
-    - Wait at most ttft_timeout_s (never past the overall deadline) for the first token.
-      On timeout, ProviderError, or an empty stream before the first token: settle the
-      reservation at 0 and try the next provider.
-    - On the first token, emit "meta" {"provider": name}, then "token" {"text": ...} per token.
-    - After the first token, never switch provider: a ProviderError now is a fatal
-      "error" {"code": "upstream_interrupted", "partial": True}.
-    - The whole call never runs past total_timeout_s from the start; past the deadline, emit
-      "error" {"code": "deadline_exceeded", "partial": <any token sent yet>}.
-    - On success, settle at the actual cost and emit
-      "done" {"provider", "output_tokens", "cost_usd"}.
-    - Every affordable provider failed before its first token: "error" {"code": "all_providers_failed"}.
-      No provider was affordable: "error" {"code": "budget_exhausted"}.
-    - Whatever happens, including the caller closing this generator early, close the
-      provider's stream (aclose()) and settle its reservation at the actual cost of the
-      tokens it produced.
-    """
-    raise NotImplementedError
-    yield  # pragma: no cover  (keeps this an async generator function)
+    for provider in providers:
+        time_left = deadline - loop.time()
+        if time_left <= 0:
+            yield Event("error", {"code": "deadline_exceeded", "partial": False})
+            return
+
+        estimated = estimate_cost_usd(provider, prompt, max_output_tokens)
+        if not budget.try_reserve(tenant, estimated):
+            continue
+
+        attempted = True
+        tokens_produced = 0
+        settled = False
+
+        def settle_once(actual: float) -> None:
+            nonlocal settled
+            if not settled:
+                settled = True
+                budget.settle(tenant, estimated, actual)
+
+        try:
+            async with aclosing(provider.stream(prompt, max_output_tokens)) as stream:
+                time_left = deadline - loop.time()
+                if time_left <= 0:
+                    settle_once(0.0)
+                    yield Event("error", {"code": "deadline_exceeded", "partial": False})
+                    return
+
+                ttft = min(ttft_timeout_s, time_left)
+                try:
+                    first_token = await asyncio.wait_for(anext(stream), timeout=ttft)
+                except TimeoutError:
+                    settle_once(0.0)
+                    if deadline - loop.time() <= 0:
+                        yield Event("error", {"code": "deadline_exceeded", "partial": False})
+                        return
+                    continue
+                except (StopAsyncIteration, ProviderError):
+                    settle_once(0.0)
+                    continue
+
+                tokens_produced = 1
+                yield Event("meta", {"provider": provider.name})
+                yield Event("token", {"text": first_token})
+
+                while True:
+                    time_left = deadline - loop.time()
+                    if time_left <= 0:
+                        actual = actual_cost_usd(provider, prompt, tokens_produced)
+                        settle_once(actual)
+                        yield Event("error", {"code": "deadline_exceeded", "partial": True})
+                        return
+
+                    try:
+                        token = await asyncio.wait_for(anext(stream), timeout=time_left)
+                    except StopAsyncIteration:
+                        actual = actual_cost_usd(provider, prompt, tokens_produced)
+                        settle_once(actual)
+                        yield Event("done", {
+                            "provider": provider.name,
+                            "output_tokens": tokens_produced,
+                            "cost_usd": actual,
+                        })
+                        return
+                    except TimeoutError:
+                        actual = actual_cost_usd(provider, prompt, tokens_produced)
+                        settle_once(actual)
+                        yield Event("error", {"code": "deadline_exceeded", "partial": True})
+                        return
+                    except ProviderError:
+                        actual = actual_cost_usd(provider, prompt, tokens_produced)
+                        settle_once(actual)
+                        yield Event("error", {"code": "upstream_interrupted", "partial": True})
+                        return
+
+                    tokens_produced += 1
+                    yield Event("token", {"text": token})
+        finally:
+            settle_once(actual_cost_usd(provider, prompt, tokens_produced) if tokens_produced else 0.0)
+
+    if not attempted:
+        yield Event("error", {"code": "budget_exhausted"})
+    else:
+        yield Event("error", {"code": "all_providers_failed"})
